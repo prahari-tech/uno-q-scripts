@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+#
+# q-setup — bring a freshly flashed Arduino UNO Q back to a usable state.
+#
+# Reflashing with `arduino-flasher-cli flash latest` (without --preserve-user)
+# wipes the whole OS and /home/arduino: WiFi credentials, the account password,
+# authorized_keys, ~/.arduino15 and ~/ArduinoApps all go. This script rebuilds
+# that, over ADB, because ADB is the only transport a fresh board has.
+#
+# Everything here is idempotent and individually runnable — reflashes fail
+# halfway, and you want to resume rather than start over.
+#
+# Usage:  bin/q-setup [command]
+# Config: bin/board.env (gitignored; see bin/board.env.example)
+
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+ENV_FILE="$BIN_DIR/board.env"
+STATE_FILE="$BIN_DIR/.board-state"
+
+BOARD_NAME=""; WIFI_SSID=""; WIFI_PSK=""; SSH_PUBKEY=""; BOARD_USER=""; BOARD_PASSWORD=""
+
+# --- plumbing ----------------------------------------------------------------
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$*"; }
+no()   { printf '\033[31m  --\033[0m %s\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+usage: q-setup [command]
+
+  all         run every step below, in order (default)
+
+  wait        block until the board appears over ADB
+  name        set the board name -> <name>.local over mDNS
+  wifi        join WiFi (needs WIFI_SSID / WIFI_PSK)
+  ssh         enable the SSH service and install your public key
+  passwd      set the account password (BOARD_PASSWORD, else prompts)
+  clock       wait for NTP — a fresh board's clock is months behind
+  hosts       drop stale host keys from this machine's known_hosts
+  indexes     refresh arduino-cli indexes and install the zephyr core
+  system      apt-refresh and upgrade the Arduino packages (no password needed)
+  bricks      pre-pull the app-bricks images, bypassing the CLI's pull deadline
+  cleanup     drop obsolete app images to reclaim disk
+  verify      prove key auth works and hand off to q-deploy
+
+  doctor      read-only: report the state of every step, change nothing
+  ssh-config  opt-in: point the ~/.ssh/config alias at the current address
+
+config: bin/board.env, gitignored. Anything unset there is prompted for.
+EOF
+}
+
+load_env() {
+    if [ -f "$ENV_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$ENV_FILE"
+        local perms
+        perms="$(stat -c '%a' "$ENV_FILE")"
+        [ "$perms" = "600" ] || warn "$ENV_FILE is mode $perms — it holds a passphrase; chmod 600 it"
+    fi
+    BOARD_NAME="${BOARD_NAME:-homeguard}"
+    BOARD_USER="${BOARD_USER:-arduino}"
+    SSH_PUBKEY="${SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+    SSH_PUBKEY="${SSH_PUBKEY/#\~/$HOME}"
+}
+
+# Ask only for what is missing, and only when someone is there to answer.
+need_wifi() {
+    [ -n "$WIFI_SSID" ] || {
+        [ -t 0 ] || die "WIFI_SSID unset and no terminal to ask on — set it in $ENV_FILE"
+        read -r -p "WiFi SSID: " WIFI_SSID
+    }
+    [ -n "$WIFI_PSK" ] || {
+        [ -t 0 ] || die "WIFI_PSK unset and no terminal to ask on — set it in $ENV_FILE"
+        read -r -s -p "WiFi passphrase for '$WIFI_SSID': " WIFI_PSK; echo
+    }
+    [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ] || die "SSID and passphrase are both required"
+}
+
+# --- the board over ADB ------------------------------------------------------
+
+adb_count() { adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device"' | wc -l; }
+
+# adb line-ends everything with CRLF; strip it or every comparison downstream
+# fails in a way that is very annoying to see.
+badb()  { adb shell "TMPDIR=/tmp $1" 2>/dev/null | tr -d '\r'; }
+badbt() { adb shell -t "TMPDIR=/tmp $1"; }
+
+require_board() {
+    local n; n="$(adb_count)"
+    [ "$n" -eq 1 ] || die "need exactly one ADB device, found $n — run 'q-setup wait'"
+}
+
+board_ip() { badb "ip -4 -o addr show dev wlan0" | awk '{print $4}' | cut -d/ -f1 | head -1; }
+
+# mDNS first, IP second — a reflash changes the IP but not the name.
+resolve_board() {
+    local mdns="$BOARD_NAME.local" ip
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+           "$BOARD_USER@$mdns" true >/dev/null 2>&1; then
+        echo "$BOARD_USER@$mdns"; return 0
+    fi
+    ip="$(board_ip 2>/dev/null || true)"
+    if [ -n "$ip" ] && ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+           "$BOARD_USER@$ip" true >/dev/null 2>&1; then
+        echo "$BOARD_USER@$ip"; return 0
+    fi
+    return 1
+}
+
+write_state() {
+    umask 077
+    cat > "$STATE_FILE" <<EOF
+# Written by bin/q-setup — the address bin/q-deploy should use over SSH.
+# Gitignored. Delete it to fall back to the ssh-config alias.
+BOARD_SSH=$1
+BOARD_NAME=$BOARD_NAME
+EOF
+    ok "recorded $1 in bin/.board-state"
+}
+
+# --- steps -------------------------------------------------------------------
+
+cmd_wait() {
+    local timeout="${1:-180}" waited=0
+    say "waiting for the board over ADB (up to ${timeout}s)"
+    while [ "$(adb_count)" -ne 1 ]; do
+        [ "$waited" -lt "$timeout" ] || die "no ADB device after ${timeout}s"
+        sleep 3; waited=$((waited + 3))
+    done
+    ok "board is up ($(badb 'hostname'))"
+}
+
+cmd_name() {
+    require_board
+    say "setting board name to '$BOARD_NAME'"
+    badb "arduino-app-cli system set-name '$BOARD_NAME'" >/dev/null || warn "set-name failed"
+    # A fresh image ships avahi disabled, so the name it just set advertises
+    # nowhere and <name>.local never resolves. Both systemctl calls are NOPASSWD.
+    if [ "$(badb 'systemctl is-active avahi-daemon')" != "active" ]; then
+        say "enabling avahi so $BOARD_NAME.local resolves"
+        badb "sudo -n /usr/bin/systemctl enable avahi-daemon" >/dev/null 2>&1 || true
+        badb "sudo -n /usr/bin/systemctl start avahi-daemon"  >/dev/null 2>&1 || true
+    fi
+    [ "$(badb 'systemctl is-active avahi-daemon')" = "active" ] \
+        && ok "$BOARD_NAME.local is advertised" \
+        || warn "avahi is not running — $BOARD_NAME.local will not resolve; IP fallback will be used"
+}
+
+cmd_wifi() {
+    require_board
+    if [ "$(badb 'nmcli -t -f STATE general')" = "connected" ] && [ -n "$(board_ip)" ]; then
+        ok "already on WiFi ($(board_ip))"; return
+    fi
+    need_wifi
+    say "joining '$WIFI_SSID'"
+    # The passphrase goes over stdin, not argv, so it never lands in the board's
+    # process list. `adb shell <cmd>` forwards stdin, which makes this possible.
+    printf '%s\n' "$WIFI_PSK" | adb shell "TMPDIR=/tmp sh -c 'read -r p; nmcli device wifi connect \"$WIFI_SSID\" password \"\$p\"'" \
+        >/dev/null 2>&1 || warn "nmcli returned an error — it may need elevation; check 'q-setup doctor'"
+    local ip; ip="$(board_ip)"
+    [ -n "$ip" ] || die "still no address on wlan0 — join WiFi from the board's first-setup screen instead"
+    ok "on WiFi at $ip"
+}
+
+cmd_ssh() {
+    require_board
+    [ -f "$SSH_PUBKEY" ] || die "no public key at $SSH_PUBKEY (set SSH_PUBKEY in $ENV_FILE)"
+
+    if [ "$(badb 'systemctl is-active ssh')" = "active" ]; then
+        ok "SSH service already running"
+    else
+        # `arduino-app-cli system network-mode enable` does this too, but prompts
+        # for the account password. The three commands underneath it are all in
+        # the board's sudoers NOPASSWD list, so driving them directly needs no
+        # password at all — which is the difference between a script that can run
+        # unattended and one that cannot.
+        #
+        # dpkg-reconfigure first, and not optionally: a freshly flashed image
+        # ships with NO host keys, and sshd exits with "no hostkeys available"
+        # until they exist. Bare command, no env prefix — sudoers uses env_reset
+        # and rejects even DEBIAN_FRONTEND.
+        say "generating SSH host keys (a fresh image ships without any)"
+        badb "sudo -n /usr/sbin/dpkg-reconfigure openssh-server" >/dev/null 2>&1 \
+            || warn "dpkg-reconfigure failed — falling back to arduino-app-cli"
+        say "enabling and starting sshd"
+        badb "sudo -n /usr/bin/systemctl enable ssh" >/dev/null 2>&1 || true
+        badb "sudo -n /usr/bin/systemctl start ssh"  >/dev/null 2>&1 || true
+        if [ "$(badb 'systemctl is-active ssh')" != "active" ]; then
+            warn "sshd still not active; trying arduino-app-cli (asks for a password)"
+            badbt "arduino-app-cli system network-mode enable" || warn "network-mode enable failed"
+        fi
+    fi
+    [ "$(badb 'systemctl is-active ssh')" = "active" ] && ok "sshd active" || warn "sshd is not running"
+
+    # ADB shell needs no password, which is exactly why the key can be installed
+    # this way: no credential is ever typed, stored, or seen.
+    say "installing $(basename "$SSH_PUBKEY") in authorized_keys"
+    adb shell "TMPDIR=/tmp sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'" \
+        < "$SSH_PUBKEY" >/dev/null
+    ok "key installed ($(badb 'wc -l < ~/.ssh/authorized_keys' | tr -d ' ') key(s) authorised)"
+}
+
+# True when the account still has the flashed image's must-change flag set.
+password_pending() {
+    [ "$(badb "passwd -S $BOARD_USER" | awk '{print $2}')" = "NP" ]
+}
+
+# A freshly flashed image leaves the account with NO password and a forced
+# change pending. Key auth then succeeds but PAM refuses the session with
+# "Password change required but no TTY available", so every non-interactive
+# SSH — and therefore all of q-deploy — fails while looking like a key problem.
+#
+# arduino-passwd is Arduino's own helper: NOPASSWD in sudoers, reads the new
+# password on stdin, needs no existing one. The value is typed here, piped
+# straight through, and stored nowhere — never in board.env, never in argv.
+cmd_passwd() {
+    require_board
+    if ! password_pending; then ok "account password already set"; return; fi
+
+    local p1 p2
+    if [ -n "${BOARD_PASSWORD:-}" ]; then
+        p1="$BOARD_PASSWORD"
+        say "setting the account password from $ENV_FILE"
+    elif [ -t 0 ]; then
+        read -r -s -p "New password for '$BOARD_USER' on the board: " p1; echo
+        read -r -s -p "Repeat it: " p2; echo
+        [ "$p1" = "$p2" ] || die "passwords do not match"
+    else
+        warn "the board account has no password and SSH sessions will be refused."
+        warn "set BOARD_PASSWORD in $ENV_FILE, or run 'bin/q-setup passwd' from a terminal."
+        return 1
+    fi
+    [ -n "$p1" ] || die "empty password"
+    printf '%s\n' "$p1" | adb shell "TMPDIR=/tmp sudo -n /usr/local/bin/arduino-passwd" >/dev/null 2>&1
+    unset p1 p2
+    if password_pending; then die "password did not take"; fi
+    ok "password set — SSH sessions will now be accepted"
+}
+
+cmd_hosts() {
+    say "dropping stale host keys from ~/.ssh/known_hosts"
+    # A reflash regenerates the host key, so every prior entry is now wrong and
+    # SSH will refuse to connect until they are gone.
+    local targets=("$BOARD_NAME.local") ip
+    if [ "$(adb_count)" -eq 1 ]; then
+        ip="$(board_ip 2>/dev/null || true)"; [ -n "$ip" ] && targets+=("$ip")
+    fi
+    # Whatever the ssh-config alias currently points at, too.
+    local aliased; aliased="$(ssh -G arduino-4gb 2>/dev/null | awk '/^hostname /{print $2}')" || true
+    [ -n "${aliased:-}" ] && targets+=("$aliased")
+    local t seen=""
+    for t in "${targets[@]}"; do
+        case " $seen " in *" $t "*) continue ;; esac
+        seen="$seen $t"
+
+        if ssh-keygen -F "$t" >/dev/null 2>&1; then
+            ssh-keygen -R "$t" >/dev/null 2>&1 && ok "removed $t"
+        else
+            no "$t — nothing cached"
+        fi
+    done
+}
+
+# A freshly flashed board has no RTC battery state and no network, so its clock
+# sits at the image build date — months behind. Every TLS handshake after that
+# fails on certificates that are "not yet valid", which reads like a network
+# fault and is not. Nothing that downloads should run before this passes.
+cmd_clock() {
+    require_board
+    local timeout="${1:-90}" waited=0 drift
+    if [ "$(badb 'timedatectl show -p NTPSynchronized --value' 2>/dev/null)" = "yes" ]; then
+        ok "clock synchronised ($(badb 'date -u +%Y-%m-%dT%H:%M:%SZ'))"; return
+    fi
+    say "waiting for NTP to correct the board's clock (up to ${timeout}s)"
+    while [ "$(badb 'timedatectl show -p NTPSynchronized --value' 2>/dev/null)" != "yes" ]; do
+        if [ "$waited" -ge "$timeout" ]; then
+            local btime; btime="$(badb 'date -u +%s')"
+            drift="unknown"
+            [ -n "$btime" ] && drift="$(( ($(date -u +%s) - btime) / 86400 )) days"
+            warn "clock still unsynchronised, $drift behind this machine."
+            warn "TLS will fail on certificates issued since then — fix it before 'indexes'."
+            return 1
+        fi
+        sleep 5; waited=$((waited + 5))
+    done
+    ok "clock synchronised ($(badb 'date -u +%Y-%m-%dT%H:%M:%SZ'))"
+}
+
+cmd_indexes() {
+    require_board
+    say "refreshing arduino-cli indexes (the 2025-11-11 staleness that broke Lab 1.6)"
+    badb "arduino-cli core update-index" >/dev/null || warn "core update-index failed"
+    badb "arduino-cli lib update-index"  >/dev/null || warn "lib update-index failed"
+    say "installing the zephyr core"
+    badb "arduino-cli core install arduino:zephyr" >/dev/null 2>&1 || true
+    ok "core: $(badb 'arduino-cli core list' | awk '/zephyr/{print $2}')"
+}
+
+ARDUINO_PKGS="arduino-app-cli arduino-app-lab arduino-router arduino-cli adbd"
+
+cmd_system() {
+    require_board
+    # Same trick as cmd_ssh: `system update --only-arduino` wraps exactly these
+    # apt-get calls but prompts for a password, while apt-get update and
+    # `apt-get install --only-upgrade -y *` are both NOPASSWD in the board's
+    # sudoers. Driving apt directly is password-free, and it also sidesteps the
+    # deadline in the CLI's own image stage that killed a pull at 79%.
+    say "refreshing apt and upgrading the Arduino packages"
+    badb "sudo -n /usr/bin/apt-get update" >/dev/null 2>&1 || warn "apt-get update failed (network? clock?)"
+    # shellcheck disable=SC2086
+    if badb "sudo -n /usr/bin/apt-get install --only-upgrade -y $ARDUINO_PKGS" >/dev/null 2>&1; then
+        local p
+        for p in $ARDUINO_PKGS; do
+            ok "$p $(badb "dpkg-query -W -f='\${Version}' $p" 2>/dev/null)"
+        done
+    else
+        warn "apt upgrade failed; falling back to arduino-app-cli (asks for a password)"
+        badbt "arduino-app-cli system update --only-arduino" || warn "system update reported an error"
+    fi
+}
+
+cmd_bricks() {
+    require_board
+    # The CLI's image stage runs under a deadline; on a slow link it gets killed
+    # mid-pull ("context canceled"). docker pull has no such deadline.
+    local ver
+    ver="$(badb 'ls /var/lib/arduino-app-cli/assets 2>/dev/null' | sort -V | tail -1)"
+    [ -n "$ver" ] || { warn "cannot determine the brick asset version — skipping"; return; }
+    say "pre-pulling app-bricks images at $ver"
+    local img
+    for img in python-apps-base ei-models-runner python-base; do
+        local ref="ghcr.io/arduino/app-bricks/$img:$ver"
+        if [ -n "$(badb "docker images -q '$ref'")" ]; then
+            ok "$img already present"
+        else
+            printf '  pulling %s ... ' "$img"
+            if badb "docker pull '$ref'" >/dev/null 2>&1; then echo "done"; else echo "FAILED"; warn "$ref"; fi
+        fi
+    done
+}
+
+# Old brick images are not removed when new ones land, and the rootfs is only
+# ~10GB. Arduino's own cleanup knows which images are still referenced.
+cmd_cleanup() {
+    require_board
+    local before after
+    before="$(badb 'df -h / | tail -1' | awk '{print $4}')"
+    say "removing obsolete app images (free: $before)"
+    badb "arduino-app-cli system cleanup" >/dev/null 2>&1 || warn "cleanup reported an error"
+    after="$(badb 'df -h / | tail -1' | awk '{print $4}')"
+    ok "free: $before -> $after"
+}
+
+cmd_verify() {
+    say "verifying"
+    local addr
+    if ! addr="$(resolve_board)"; then
+        if password_pending; then
+            die "SSH refuses sessions: the board account has no password yet.
+       Key auth succeeds, then PAM demands a change. Run 'bin/q-setup passwd'."
+        fi
+        die "cannot reach the board over SSH by name or IP — run 'q-setup doctor'"
+    fi
+    ok "key auth works: $addr"
+    write_state "$addr"
+    if [ -x "$REPO_ROOT/bin/q-deploy" ]; then
+        say "handing off to q-deploy"
+        "$REPO_ROOT/bin/q-deploy" status || warn "q-deploy status failed"
+    fi
+}
+
+cmd_ssh_config() {
+    local cfg="$HOME/.ssh/config" addr host
+    addr="$(resolve_board)" || die "cannot resolve the board — run 'q-setup verify' first"
+    host="${addr#*@}"
+    [ -f "$cfg" ] || die "no $cfg"
+    cp -p "$cfg" "$cfg.q-setup.bak"
+    say "backed up $cfg -> $cfg.q-setup.bak"
+    # Only the HostName line inside the existing arduino-4gb block is touched.
+    awk -v h="$host" '
+        /^Host arduino-4gb$/ { inblk = 1 }
+        inblk && /^[[:space:]]*HostName / { sub(/HostName .*/, "HostName " h); inblk = 0 }
+        { print }
+    ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    ok "arduino-4gb now points at $host"
+}
+
+cmd_doctor() {
+    printf '\033[1mboard\033[0m\n'
+    if [ "$(adb_count)" -eq 1 ]; then
+        ok "ADB: $(badb 'hostname') — $(badb '. /etc/os-release; echo $PRETTY_NAME')"
+        local ip; ip="$(board_ip 2>/dev/null || true)"
+        [ -n "$ip" ] && ok "WiFi: $ip" || no "WiFi: no address on wlan0"
+        [ "$(badb 'systemctl is-active ssh')" = "active" ] && ok "ssh service: active" || no "ssh service: inactive"
+        [ -n "$(badb 'cat ~/.ssh/authorized_keys 2>/dev/null')" ] && ok "authorized_keys: present" || no "authorized_keys: absent"
+        password_pending && no "account password: NOT set — SSH sessions will be refused" || ok "account password: set"
+        if [ "$(badb 'timedatectl show -p NTPSynchronized --value')" = "yes" ]; then
+            ok "clock: synchronised"
+        else
+            btime="$(badb 'date -u +%s')"
+            [ -n "$btime" ] && no "clock: NOT synchronised, $(( ($(date -u +%s) - btime) / 86400 )) days behind" \
+                            || no "clock: NOT synchronised"
+        fi
+        ok "app-cli $(badb 'arduino-app-cli version' | head -1 | awk '{print $NF}'), core $(badb 'arduino-cli core list' | awk '/zephyr/{print $2}')"
+        ok "library index: $(badb 'date -r ~/.arduino15/library_index.json +%Y-%m-%d 2>/dev/null || echo absent')"
+        ok "images: $(badb 'docker images -q' | grep -c . || true) present, $(badb 'df -h / | tail -1' | awk '{print $4}') free"
+    else
+        no "ADB: no device"
+    fi
+    printf '\033[1mthis machine\033[0m\n'
+    [ -f "$ENV_FILE" ] && ok "board.env present (mode $(stat -c '%a' "$ENV_FILE"))" || no "board.env absent — values will be prompted"
+    [ -f "$SSH_PUBKEY" ] && ok "pubkey: $SSH_PUBKEY" || no "pubkey: $SSH_PUBKEY missing"
+    if [ -f "$STATE_FILE" ]; then ok "board-state: $(awk -F= '/BOARD_SSH/{print $2}' "$STATE_FILE")"; else no "board-state: absent"; fi
+    if addr="$(resolve_board 2>/dev/null)"; then ok "SSH key auth: $addr"; else no "SSH key auth: not working"; fi
+}
+
+cmd_all() {
+    cmd_wait; cmd_name; cmd_wifi; cmd_ssh; cmd_passwd || true; cmd_hosts
+    cmd_clock || die "refusing to run downloads against a wrong clock"
+    cmd_indexes; cmd_system; cmd_bricks; cmd_cleanup; cmd_verify
+    say "done — the board is provisioned"
+}
+
+# --- entry point -------------------------------------------------------------
+
+load_env
+case "${1:-all}" in
+    all)        cmd_all ;;
+    wait)       cmd_wait "${2:-180}" ;;
+    name)       cmd_name ;;
+    wifi)       cmd_wifi ;;
+    ssh)        cmd_ssh ;;
+    passwd)     cmd_passwd ;;
+    clock)      cmd_clock "${2:-90}" ;;
+    hosts)      cmd_hosts ;;
+    indexes)    cmd_indexes ;;
+    system)     cmd_system ;;
+    bricks)     cmd_bricks ;;
+    cleanup)    cmd_cleanup ;;
+    verify)     cmd_verify ;;
+    doctor)     cmd_doctor ;;
+    ssh-config) cmd_ssh_config ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $1" ;;
+esac

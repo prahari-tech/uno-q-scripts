@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+#
+# q-deploy — push and run an App Lab app on the Arduino UNO Q.
+#
+# Wraps the sequence that Lab 1.6 established, so its three traps stop being
+# things to remember:
+#
+#   1. adbd exports Android's TMPDIR=/data/local/tmp into every `adb shell`.
+#      Any Go tool calling os.TempDir() — arduino-cli, adb — dies before doing
+#      any work. TMPDIR=/tmp appears exactly once below, in remote_sh().
+#   2. The apps directory is ~/ArduinoApps, not ~/apps.
+#   3. `adb push <dir> <dest>/` flattens the contents into <dest>. The
+#      destination must be named explicitly.
+#
+# Usage:  bin/q-deploy [-H <host>|adb] <command> [app]
+# See:    journal/2026-08-22-lab-1.6-rpc-bridge.md
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCAL_APPS="$REPO_ROOT/src/mcu"
+REMOTE_APPS="${Q_APPS_DIR:-/home/arduino/ArduinoApps}"
+DEFAULT_APP="q-bridge"
+
+# bin/q-setup records the address it provisioned. A reflash changes the board's
+# IP, so preferring that file over the ssh-config alias keeps this working
+# without anyone editing ~/.ssh/config.
+BOARD_SSH=""
+[ -f "$REPO_ROOT/bin/.board-state" ] && . "$REPO_ROOT/bin/.board-state"
+DEFAULT_SSH_HOST="${Q_HOST:-${BOARD_SSH:-arduino-4gb}}"
+
+FORCE_HOST=""
+TRANSPORT=""
+SSH_HOST=""
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+
+# --- plumbing ----------------------------------------------------------------
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+usage: q-deploy [-H <host>|adb] <command> [app]
+
+commands:
+  deploy   check, push, restart          (default; app defaults to q-bridge)
+  check    local pre-flight only, touches no board
+  push     copy to the board, don't start
+  start    start the app on the board
+  stop     stop the app
+  logs     follow the app's logs
+  status   list the apps installed on the board
+  clean    wipe the app's build cache, forcing a full rebuild
+
+transport is auto-detected: $Q_HOST or arduino-4gb over SSH if it answers,
+otherwise a single attached ADB device. -H forces one ("-H adb" for USB).
+
+env:  Q_HOST  Q_APPS_DIR
+EOF
+}
+
+# --- transport ---------------------------------------------------------------
+
+ssh_reachable() { ssh "${SSH_OPTS[@]}" "$1" true >/dev/null 2>&1; }
+
+adb_device_count() { adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device"' | wc -l; }
+
+select_transport() {
+    if [ "$FORCE_HOST" = "adb" ]; then
+        [ "$(adb_device_count)" -eq 1 ] || die "-H adb given, but there is not exactly one attached device"
+        TRANSPORT="adb"
+        say "transport: adb (forced)"
+        return
+    fi
+
+    if [ -n "$FORCE_HOST" ]; then
+        ssh_reachable "$FORCE_HOST" || die "-H $FORCE_HOST given, but it does not answer to key auth"
+        TRANSPORT="ssh"; SSH_HOST="$FORCE_HOST"
+        say "transport: ssh $SSH_HOST (forced)"
+        return
+    fi
+
+    # BatchMode above matters: a broken key falls through to ADB rather than
+    # prompting for the board password. This script never handles it.
+    if ssh_reachable "$DEFAULT_SSH_HOST"; then
+        TRANSPORT="ssh"; SSH_HOST="$DEFAULT_SSH_HOST"
+        say "transport: ssh $SSH_HOST"
+        return
+    fi
+
+    local n
+    n="$(adb_device_count)"
+    case "$n" in
+        1) TRANSPORT="adb"; say "transport: adb (ssh $DEFAULT_SSH_HOST unreachable)" ;;
+        0) die "no board: ssh $DEFAULT_SSH_HOST unreachable and no adb device attached" ;;
+        *) die "$n adb devices attached — name one board with -H <host>" ;;
+    esac
+}
+
+# Run one command on the board. The ADB branch is the only place TMPDIR is set.
+remote_sh() {
+    if [ "$TRANSPORT" = "ssh" ]; then
+        ssh "${SSH_OPTS[@]}" "$SSH_HOST" "$1"
+    else
+        adb shell "TMPDIR=/tmp $1"
+    fi
+}
+
+# Same, but attached to a terminal — for anything that streams.
+remote_sh_tty() {
+    if [ "$TRANSPORT" = "ssh" ]; then
+        ssh "${SSH_OPTS[@]}" -t "$SSH_HOST" "$1"
+    else
+        adb shell "TMPDIR=/tmp $1"
+    fi
+}
+
+remote_push() {
+    local app="$1"
+
+    # Prune, then extract over the top. Deleting the whole directory would take
+    # .cache with it and make every push a full rebuild; leaving stale files
+    # behind is worse, because arduino-cli compiles every .ino in the sketch
+    # directory. So: everything except .cache goes.
+    remote_sh "mkdir -p '$REMOTE_APPS/$app' && find '$REMOTE_APPS/$app' -mindepth 1 -maxdepth 1 ! -name .cache -exec rm -rf {} +"
+
+    if [ "$TRANSPORT" = "ssh" ]; then
+        # rsync is not installed on the board; a tar stream needs nothing but tar.
+        tar -C "$LOCAL_APPS" -czf - "$app" \
+            | ssh "${SSH_OPTS[@]}" "$SSH_HOST" "tar -C '$REMOTE_APPS' -xzf -"
+    else
+        # `adb push <dir> <dest>` is ambiguous: it CREATES dest when dest is
+        # absent, but NESTS inside it when dest exists — and the prune above
+        # always creates it, so pushing the app directory would land the app at
+        # <dest>/<app>/<app>. Push the children instead; with several sources
+        # adb always treats the last argument as a destination directory.
+        local -a entries=() e
+        shopt -s dotglob nullglob
+        for e in "$LOCAL_APPS/$app"/*; do
+            [ "$(basename "$e")" = ".cache" ] || entries+=("$e")
+        done
+        shopt -u dotglob nullglob
+        [ "${#entries[@]}" -gt 0 ] || die "$app is empty — nothing to push"
+        adb push "${entries[@]}" "$REMOTE_APPS/$app/" >/dev/null
+    fi
+}
+
+# --- commands ----------------------------------------------------------------
+
+require_app() {
+    [ -d "$LOCAL_APPS/$1" ] || die "no such app: $1 (looked in $LOCAL_APPS)"
+    [ -f "$LOCAL_APPS/$1/app.yaml" ] || die "$1 has no app.yaml — not an App Lab app"
+}
+
+cmd_check() {
+    local app="$1" dir="$LOCAL_APPS/$1"
+    require_app "$app"
+
+    # An unpinned platform is what lets the laptop and the board drift apart:
+    # whether Arduino_RouterBridge comes bundled with the core or has to be
+    # installed from the Library Manager changed between core versions, so an
+    # unpinned profile builds against two different toolchains and this check
+    # stops predicting the deploy. Pin `platform: arduino:zephyr (x.y.z)`.
+    local yaml="$dir/sketch/sketch.yaml"
+    if [ -f "$yaml" ] && grep -qE '^[[:space:]]*-[[:space:]]*platform:[[:space:]]*arduino:zephyr[[:space:]]*$' "$yaml"; then
+        printf '\033[33mwarning:\033[0m %s\n' \
+            "$app/sketch/sketch.yaml does not pin a platform version — this compiles
+         against whatever core this machine has, which may not be the board's."
+    fi
+
+    if [ -d "$dir/sketch" ]; then
+        say "compiling $app/sketch"
+        arduino-cli compile "$dir/sketch"
+    fi
+
+    if compgen -G "$dir/python/*.py" >/dev/null; then
+        say "byte-compiling $app/python"
+        python3 -m py_compile "$dir"/python/*.py
+        find "$dir/python" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+    fi
+
+    say "local checks passed — note this is a weaker signal than it looks;"
+    say "a clean compile here does not mean a clean build on the board."
+}
+
+cmd_push() {
+    local app="$1"
+    require_app "$app"
+    select_transport
+    say "pushing $app -> $REMOTE_APPS/$app"
+    remote_push "$app"
+}
+
+cmd_start() {
+    local app="$1"
+    select_transport
+    say "starting $app"
+    remote_sh "arduino-app-cli app start '$REMOTE_APPS/$app'"
+}
+
+cmd_stop() {
+    local app="$1"
+    select_transport
+    say "stopping $app"
+    remote_sh "arduino-app-cli app stop '$REMOTE_APPS/$app'"
+}
+
+cmd_logs() {
+    local app="$1"
+    select_transport
+    say "logs for $app — ctrl-c to stop"
+    remote_sh_tty "arduino-app-cli app logs '$REMOTE_APPS/$app'"
+}
+
+cmd_status() {
+    select_transport
+    remote_sh "arduino-app-cli app list" | awk 'NR == 1 || /^user:/'
+}
+
+cmd_clean() {
+    local app="$1"
+    select_transport
+    say "wiping build cache for $app"
+    remote_sh "rm -rf '$REMOTE_APPS/$app/.cache'"
+}
+
+cmd_deploy() {
+    local app="$1"
+    cmd_check "$app"
+    cmd_push "$app"
+    # Already running? Stop it, or start has nothing to do. Failure is fine —
+    # it usually just means it was not running.
+    remote_sh "arduino-app-cli app stop '$REMOTE_APPS/$app'" >/dev/null 2>&1 || true
+    cmd_start "$app"
+}
+
+# --- entry point -------------------------------------------------------------
+
+while getopts ":H:h" opt; do
+    case "$opt" in
+        H) FORCE_HOST="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        :) die "-$OPTARG needs a value" ;;
+        \?) die "unknown option: -$OPTARG" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+command="${1:-deploy}"
+app="${2:-$DEFAULT_APP}"
+
+case "$command" in
+    deploy) cmd_deploy "$app" ;;
+    check)  cmd_check  "$app" ;;
+    push)   cmd_push   "$app" ;;
+    start)  cmd_start  "$app" ;;
+    stop)   cmd_stop   "$app" ;;
+    logs)   cmd_logs   "$app" ;;
+    clean)  cmd_clean  "$app" ;;
+    status) cmd_status ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $command" ;;
+esac

@@ -1,0 +1,10 @@
+# The real credentials file. Never commit this.
+#
+# bin/board.env holds the WiFi passphrase and the board account password in
+# plaintext. Only bin/board.env.example, which has empty values, belongs in git.
+bin/board.env
+
+# Belt and braces: any other .env anywhere.
+.env
+*.env
+!*.env.example

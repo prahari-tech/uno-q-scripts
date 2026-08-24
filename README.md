@@ -62,13 +62,37 @@ inside the destination when the destination already exists.
 cp bin/board.env.example bin/board.env && chmod 600 bin/board.env
 ```
 
-`bin/board.env` holds the WiFi passphrase and the board password. **It is
+`board.env` holds the WiFi passphrase and the board password. **It is
 gitignored and must stay that way.** Anything left empty is prompted for at run
 time instead, so filling it in is optional — it only makes unattended reruns
 possible.
 
 Secrets are only ever piped over stdin, never passed as arguments, so they do
 not appear in the board's process list.
+
+### Using these from another project
+
+The scripts are generic, but the config and the apps are not — they belong to
+whatever project you are working on. So paths resolve *outward* rather than from
+the script's own directory:
+
+| | resolves to |
+|---|---|
+| `board.env`, `.board-state` | `$Q_CONFIG_DIR`, else `<git root>/bin`, else beside the script |
+| app sources for `q-deploy` | `$Q_APPS_SRC`, else `<git root>/src/mcu` |
+
+So putting `bin/` on your `PATH` and running `q-deploy` from inside your own
+project picks up that project's `bin/board.env` and `src/mcu`, and this repo
+stays a clone you only ever pull:
+
+```bash
+export PATH="$PATH:/path/to/uno-q-scripts/bin"
+cd ~/my-robot && q-deploy deploy q-bridge   # uses ~/my-robot/bin/board.env
+```
+
+Run them from inside this repo instead and they fall back to their own `bin/`,
+which is what a standalone clone wants. Remember to gitignore `board.env` and
+`.board-state` in whichever project holds them.
 
 ## Requirements
 

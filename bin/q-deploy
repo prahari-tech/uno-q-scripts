@@ -12,21 +12,41 @@
 #   3. `adb push <dir> <dest>/` flattens the contents into <dest>. The
 #      destination must be named explicitly.
 #
-# Usage:  bin/q-deploy [-H <host>|adb] <command> [app]
+# Usage:  q-deploy [-H <host>|adb] <command> [app]
 # See:    journal/2026-08-22-lab-1.6-rpc-bridge.md
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCAL_APPS="$REPO_ROOT/src/mcu"
+# These scripts are generic; the board config and the apps they push belong to
+# whatever project you run them from. So paths resolve outward, not from the
+# script's own location:
+#
+#   $Q_CONFIG_DIR   explicit override, wins over everything
+#   <git root>/bin  the project you are standing in — the normal case
+#   <script>/bin    a standalone clone with no project around it
+#
+# $Q_APPS_SRC does the same for the app sources q-deploy pushes.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+resolve_config_dir() {
+    if [ -n "${Q_CONFIG_DIR:-}" ]; then printf '%s\n' "$Q_CONFIG_DIR"; return; fi
+    if [ -d "$PROJECT_ROOT/bin" ] && [ "$PROJECT_ROOT/bin" != "$SCRIPT_DIR" ]; then
+        printf '%s\n' "$PROJECT_ROOT/bin"; return
+    fi
+    printf '%s\n' "$SCRIPT_DIR"
+}
+CONFIG_DIR="$(resolve_config_dir)"
+
+LOCAL_APPS="${Q_APPS_SRC:-$PROJECT_ROOT/src/mcu}"
 REMOTE_APPS="${Q_APPS_DIR:-/home/arduino/ArduinoApps}"
 DEFAULT_APP="q-bridge"
 
-# bin/q-setup records the address it provisioned. A reflash changes the board's
+# q-setup records the address it provisioned. A reflash changes the board's
 # IP, so preferring that file over the ssh-config alias keeps this working
 # without anyone editing ~/.ssh/config.
 BOARD_SSH=""
-[ -f "$REPO_ROOT/bin/.board-state" ] && . "$REPO_ROOT/bin/.board-state"
+[ -f "$CONFIG_DIR/.board-state" ] && . "$CONFIG_DIR/.board-state"
 DEFAULT_SSH_HOST="${Q_HOST:-${BOARD_SSH:-arduino-4gb}}"
 
 FORCE_HOST=""
@@ -57,7 +77,10 @@ commands:
 transport is auto-detected: $Q_HOST or arduino-4gb over SSH if it answers,
 otherwise a single attached ADB device. -H forces one ("-H adb" for USB).
 
-env:  Q_HOST  Q_APPS_DIR
+env:  Q_HOST        board address for SSH, overriding .board-state
+      Q_APPS_DIR    apps directory on the board  (default /home/arduino/ArduinoApps)
+      Q_APPS_SRC    app sources here             (default <git root>/src/mcu)
+      Q_CONFIG_DIR  board.env / .board-state     (default <git root>/bin)
 EOF
 }
 

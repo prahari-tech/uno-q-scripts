@@ -4,6 +4,10 @@
 # plaintext. Only bin/board.env.example, which has empty values, belongs in git.
 bin/board.env
 
+# The provisioned board address, written by q-setup. Machine-local.
+bin/.board-state
+.board-state
+
 # Belt and braces: any other .env anywhere.
 .env
 *.env

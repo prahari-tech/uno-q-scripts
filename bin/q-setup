@@ -10,15 +10,35 @@
 # Everything here is idempotent and individually runnable — reflashes fail
 # halfway, and you want to resume rather than start over.
 #
-# Usage:  bin/q-setup [command]
-# Config: bin/board.env (gitignored; see bin/board.env.example)
+# Usage:  q-setup [command]
+# Config: board.env in $Q_CONFIG_DIR, else <git root>/bin, else beside this
+#         script (gitignored; see board.env.example)
 
 set -euo pipefail
 
-BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
-ENV_FILE="$BIN_DIR/board.env"
-STATE_FILE="$BIN_DIR/.board-state"
+# These scripts are generic; the board config and the apps they push belong to
+# whatever project you run them from. So paths resolve outward, not from the
+# script's own location:
+#
+#   $Q_CONFIG_DIR   explicit override, wins over everything
+#   <git root>/bin  the project you are standing in — the normal case
+#   <script>/bin    a standalone clone with no project around it
+#
+# $Q_APPS_SRC does the same for the app sources q-deploy pushes.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+resolve_config_dir() {
+    if [ -n "${Q_CONFIG_DIR:-}" ]; then printf '%s\n' "$Q_CONFIG_DIR"; return; fi
+    if [ -d "$PROJECT_ROOT/bin" ] && [ "$PROJECT_ROOT/bin" != "$SCRIPT_DIR" ]; then
+        printf '%s\n' "$PROJECT_ROOT/bin"; return
+    fi
+    printf '%s\n' "$SCRIPT_DIR"
+}
+CONFIG_DIR="$(resolve_config_dir)"
+
+ENV_FILE="$CONFIG_DIR/board.env"
+STATE_FILE="$CONFIG_DIR/.board-state"
 
 BOARD_NAME=""; WIFI_SSID=""; WIFI_PSK=""; SSH_PUBKEY=""; BOARD_USER=""; BOARD_PASSWORD=""
 
@@ -52,7 +72,8 @@ usage: q-setup [command]
   doctor      read-only: report the state of every step, change nothing
   ssh-config  opt-in: point the ~/.ssh/config alias at the current address
 
-config: bin/board.env, gitignored. Anything unset there is prompted for.
+config: board.env, gitignored, in $Q_CONFIG_DIR or <git root>/bin.
+        Anything unset there is prompted for.
 EOF
 }
 
@@ -117,12 +138,12 @@ resolve_board() {
 write_state() {
     umask 077
     cat > "$STATE_FILE" <<EOF
-# Written by bin/q-setup — the address bin/q-deploy should use over SSH.
+# Written by q-setup — the address q-deploy should use over SSH.
 # Gitignored. Delete it to fall back to the ssh-config alias.
 BOARD_SSH=$1
 BOARD_NAME=$BOARD_NAME
 EOF
-    ok "recorded $1 in bin/.board-state"
+    ok "recorded $1 in $STATE_FILE"
 }
 
 # --- steps -------------------------------------------------------------------
@@ -364,15 +385,15 @@ cmd_verify() {
     if ! addr="$(resolve_board)"; then
         if password_pending; then
             die "SSH refuses sessions: the board account has no password yet.
-       Key auth succeeds, then PAM demands a change. Run 'bin/q-setup passwd'."
+       Key auth succeeds, then PAM demands a change. Run 'q-setup passwd'."
         fi
         die "cannot reach the board over SSH by name or IP — run 'q-setup doctor'"
     fi
     ok "key auth works: $addr"
     write_state "$addr"
-    if [ -x "$REPO_ROOT/bin/q-deploy" ]; then
+    if [ -x "$SCRIPT_DIR/q-deploy" ]; then
         say "handing off to q-deploy"
-        "$REPO_ROOT/bin/q-deploy" status || warn "q-deploy status failed"
+        "$SCRIPT_DIR/q-deploy" status || warn "q-deploy status failed"
     fi
 }
 
@@ -415,6 +436,7 @@ cmd_doctor() {
         no "ADB: no device"
     fi
     printf '\033[1mthis machine\033[0m\n'
+    ok "config dir: $CONFIG_DIR"
     [ -f "$ENV_FILE" ] && ok "board.env present (mode $(stat -c '%a' "$ENV_FILE"))" || no "board.env absent — values will be prompted"
     [ -f "$SSH_PUBKEY" ] && ok "pubkey: $SSH_PUBKEY" || no "pubkey: $SSH_PUBKEY missing"
     if [ -f "$STATE_FILE" ]; then ok "board-state: $(awk -F= '/BOARD_SSH/{print $2}' "$STATE_FILE")"; else no "board-state: absent"; fi
